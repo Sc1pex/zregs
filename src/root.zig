@@ -43,7 +43,7 @@ pub fn FieldWithValues(comptime _offset: u8, comptime _width: u8, comptime _acce
 }
 
 /// A struct containing the 4 types required for using a register
-const RegisterStructs = struct {
+pub const RegisterStructs = struct {
     /// A packed struct with the actual representation of the hw register
     hw_repr: type,
     /// Contains the fields that can be read out of the register
@@ -66,7 +66,8 @@ pub fn Register(comptime width: u8, comptime fields: type) RegisterStructs {
         @compileError("fields cannot be an empty struct");
     }
 
-    var padded_fields: [32]struct {
+    // Every field and every gap is at least 1 bit wide
+    var padded_fields: [width]struct {
         name: []const u8,
         width: u8,
         field_type: type,
@@ -78,11 +79,12 @@ pub fn Register(comptime width: u8, comptime fields: type) RegisterStructs {
     var last_end: ?u8 = null;
     inline for (info.@"struct".fields) |field| {
         const start = last_end orelse 0;
-        const offset_diff = field.type.offset - start;
-
         if (start > field.type.offset) {
             @compileError("Overlapping or out of order fields in register definition");
-        } else if (offset_diff > 0) {
+        }
+
+        const offset_diff = field.type.offset - start;
+        if (offset_diff > 0) {
             padded_fields[num_padded_fields] = .{
                 .name = std.fmt.comptimePrint("_reserved{d}", .{num_padded_fields}),
                 .width = offset_diff,
@@ -92,6 +94,9 @@ pub fn Register(comptime width: u8, comptime fields: type) RegisterStructs {
         }
 
         last_end = field.type.offset + field.type.width;
+        if (last_end.? > width) {
+            @compileError("Field " ++ field.name ++ " does not fit in the register width");
+        }
         padded_fields[num_padded_fields] = .{
             .name = field.name,
             .width = field.type.width,
@@ -203,10 +208,15 @@ pub fn RegisterMap(comptime registers: []const struct { []const u8, usize, Regis
         const name, const offset, const reg = entry;
 
         const start = last_end orelse 0;
-        const padding = offset - start;
         if (start > offset) {
             @compileError("Overlapping or out of order registers in register map");
-        } else if (padding > 0) {
+        }
+        if (offset % @alignOf(reg.hw_repr) != 0) {
+            @compileError("Register " ++ name ++ " is not aligned to its size");
+        }
+
+        const padding = offset - start;
+        if (padding > 0) {
             map_field_names[i] = std.fmt.comptimePrint("_padding{}", .{i});
             map_field_types[i] = [padding]u8;
             map_field_attrs[i] = .{
@@ -270,4 +280,81 @@ fn RegisterAccessor(comptime Types: RegisterStructs) type {
             ptr.* = raw;
         }
     };
+}
+
+const testing = std.testing;
+
+const TestMode = enum(u2) {
+    off = 0b00,
+    slow = 0b01,
+    fast = 0b10,
+};
+
+const TestCtrl = Register(32, struct {
+    enable: Field(0, 1, .RW),
+    mode: FieldWithValues(4, 2, .RW, TestMode),
+    busy: Field(8, 1, .RO),
+    clear: Field(9, 1, .WO),
+    value: Field(16, 16, .RW),
+});
+
+const TestData = Register(32, struct {
+    data: Field(0, 8, .RW),
+});
+
+const TestMap = RegisterMap(&.{
+    .{ "ctrl", 0x00, TestCtrl },
+    .{ "data", 0x10, TestData },
+});
+
+test "register hw representation matches register width" {
+    try testing.expectEqual(32, @bitSizeOf(TestCtrl.hw_repr));
+    try testing.expectEqual(32, @bitSizeOf(TestData.hw_repr));
+}
+
+test "access types control read, write and modify fields" {
+    try testing.expect(@hasField(TestCtrl.read, "busy"));
+    try testing.expect(!@hasField(TestCtrl.read, "clear"));
+    try testing.expect(@hasField(TestCtrl.write, "clear"));
+    try testing.expect(!@hasField(TestCtrl.write, "busy"));
+    try testing.expect(!@hasField(TestCtrl.modify, "busy"));
+    try testing.expectEqual(TestMode, @FieldType(TestCtrl.read, "mode"));
+    try testing.expectEqual(?TestMode, @FieldType(TestCtrl.modify, "mode"));
+}
+
+test "register map places registers at their offsets" {
+    try testing.expectEqual(0x00, @offsetOf(TestMap, "ctrl"));
+    try testing.expectEqual(0x10, @offsetOf(TestMap, "data"));
+}
+
+test "read extracts fields from the raw register" {
+    var mem = [_]u32{0} ** 5;
+    const regs: *volatile TestMap = @ptrCast(&mem);
+
+    mem[0] = 0xBEEF_0000 | (1 << 8) | (0b10 << 4) | 1;
+    const ctrl = regs.ctrl.read();
+    try testing.expectEqual(1, ctrl.enable);
+    try testing.expectEqual(TestMode.fast, ctrl.mode);
+    try testing.expectEqual(1, ctrl.busy);
+    try testing.expectEqual(0xBEEF, ctrl.value);
+}
+
+test "write sets every writable field and zeroes the rest" {
+    var mem = [_]u32{0xFFFF_FFFF} ** 5;
+    const regs: *volatile TestMap = @ptrCast(&mem);
+
+    regs.ctrl.write(.{ .enable = 1, .mode = .slow, .clear = 1, .value = 0x1234 });
+    try testing.expectEqual(0x1234_0000 | (1 << 9) | (0b01 << 4) | 1, mem[0]);
+
+    regs.data.write(.{ .data = 0xAB });
+    try testing.expectEqual(0xAB, mem[4]);
+}
+
+test "modify only changes the given fields" {
+    var mem = [_]u32{0} ** 5;
+    const regs: *volatile TestMap = @ptrCast(&mem);
+
+    mem[0] = 0xBEEF_0000 | (1 << 8) | 1;
+    regs.ctrl.modify(.{ .mode = .fast });
+    try testing.expectEqual(0xBEEF_0000 | (1 << 8) | (0b10 << 4) | 1, mem[0]);
 }
